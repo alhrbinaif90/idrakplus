@@ -1,20 +1,58 @@
-name: Jekyll site CI
-
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+version: "2"
+stages:
+  - name: prepare
+    runs-on: warm-agent
     steps:
-    - uses: actions/checkout@v4
-    - name: Build the site in the jekyll/builder container
-      run: |
-        docker run \
-        -v ${{ github.workspace }}:/srv/jekyll -v ${{ github.workspace }}/_site:/srv/jekyll/_site \
-        jekyll/builder:latest /bin/bash -c "chmod -R 777 /srv/jekyll && jekyll build --future"
+      - checkout: repo
+      # --- إضافة خطوة بناء موقع Jekyll (مطلوب لإنشاء مجلد _site) ---
+      - name: Build Jekyll Website
+        run: |
+          echo "Starting Jekyll website build..."
+          # استخدام حاوية jekyll/builder لبناء الموقع
+          docker run \
+          -v ${{ github.workspace }}:/srv/jekyll -v ${{ github.workspace }}/_site:/srv/jekyll/_site \
+          jekyll/builder:latest /bin/bash -c "chmod -R 777 /srv/jekyll && jekyll build --future"
+          echo "Jekyll build completed. Site is in the _site directory."
+      # -----------------------------------------------------------
+      - run: ./pipelines/prepare-cache.sh
+
+  - name: build-and-scan
+    runs-on: agent-${ARCH}
+    env:
+      SCAN_SEVERITY: "CRITICAL,HIGH"
+    steps:
+      # buildx-build سيقوم الآن ببناء صورة Docker التي تحتوي على ملفات Jekyll المبناة في مجلد _site
+      - run: ./pipelines/buildx-build.sh
+      - run: ./pipelines/scan.sh ${IMAGE}
+
+  - name: sbom
+    when: previous.success
+    steps:
+      - run: ./pipelines/generate-sbom.sh ${IMAGE}
+
+  - name: attest-and-publish
+    when: previous.success
+    steps:
+      - run: ./pipelines/cosign-sign.sh ${IMAGE}
+      - run: ./pipelines/publish-artifact.sh ${IMAGE}
+      
+  # --- بوابة التحقق المالي (تتطلب السر NAIF_ADSENSE_ID) ---
+  - name: monetization-check
+    when: previous.success
+    steps:
+      - run: ./pipelines/monetization-gate.sh
+        env:
+          NAIF_ADSENSE_ID: ${{ secrets.NAIF_ADSENSE_ID }}
+  # ----------------------------------------------------
+
+  - name: approval-prod
+    when: branch == "main"
+    approvals:
+      required: true
+      approvers: ["manager_a","lead_dev_b"]
+
+  - name: deploy
+    when: approvals.passed
+    steps:
+      - run: ./pipelines/deploy-prod.sh
+
